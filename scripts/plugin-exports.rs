@@ -77,6 +77,28 @@ fn emit_static_runtime() {
             println!("cargo:rustc-link-search={}", shim.display());
         }
     }
+    if target_os == "windows" {
+        // Our archives are link-args, so they come after rustc's mingw
+        // native libs (libmingwex, libmingw32, msvcrt, kernel32, ...) and
+        // libstdc++.a's references to pthread_*, _tls_index and the CRT
+        // import thunks would dangle; static archives are only scanned
+        // once, at their position. Re-list the providers after the
+        // archives, as g++'s own driver line does. Force the static
+        // libpthread.a (same -l: spelling rustc uses) so the DLL does not
+        // pick up a libwinpthread dependency.
+        println!("cargo:rustc-link-arg=-Wl,--start-group");
+        for lib in [
+            "-l:libpthread.a",
+            "-lmingwex",
+            "-lmingw32",
+            "-lmsvcrt",
+            "-lkernel32",
+            "-lntdll",
+        ] {
+            println!("cargo:rustc-link-arg={lib}");
+        }
+        println!("cargo:rustc-link-arg=-Wl,--end-group");
+    }
 }
 
 fn gxx_print_file_name(archive: &str) -> Option<std::path::PathBuf> {
