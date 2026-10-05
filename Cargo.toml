@@ -22,3 +22,6 @@ ppdrive = "0.2.0"
 serde = "1.0.229"
 serde_json = "1.0.151"
 ppff-video-conversion = { path = "video-conversion", version = "0.1.0", package = "ppff-video-conversion" }
+
+[profile.release]
+strip = "symbols"

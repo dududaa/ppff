@@ -1,28 +1,33 @@
 use std::env;
 use std::path::PathBuf;
 
+include!("../scripts/plugin-exports.rs");
+
 const LIBRARIES: &[&str] = &["libavfilter", "libavutil"];
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../scripts/plugin-exports.rs");
+    emit_plugin_exports();
     println!("cargo:rerun-if-changed=src/ffi/wrapper.h");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
+    println!("cargo:rerun-if-env-changed=PPDRIVE_FFMPEG_STATIC");
 
     let mut include_paths: Vec<PathBuf> = Vec::new();
 
     for library in LIBRARIES {
-        let lib = pkg_config::Config::new()
-            .probe(library)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "Failed to find {library} via pkg-config: {e}\n\
+        let mut config = pkg_config::Config::new();
+        config.statik(env::var_os("PPDRIVE_FFMPEG_STATIC").is_some());
+        let lib = config.probe(library).unwrap_or_else(|e| {
+            panic!(
+                "Failed to find {library} via pkg-config: {e}\n\
                  Install the FFmpeg development packages:\n\
                  - Debian/Ubuntu: sudo apt install libavfilter-dev libavutil-dev\n\
                  - Fedora: sudo dnf install ffmpeg-devel\n\
                  - macOS: brew install ffmpeg pkg-config\n\
                  - Windows (MSYS2): pacman -S mingw-w64-x86_64-ffmpeg"
-                )
-            });
+            )
+        });
 
         for path in lib.include_paths {
             if !include_paths.contains(&path) {
