@@ -68,5 +68,18 @@ fn gxx_print_file_name(archive: &str) -> Option<std::path::PathBuf> {
         return None;
     }
     let path = std::path::PathBuf::from(printed);
+    if path.is_absolute() {
+        return Some(path);
+    }
+    // MSYS2's g++ reports POSIX paths such as /mingw64/lib/...; rustc runs
+    // under Git Bash there, so translate with cygpath (both Git Bash and
+    // MSYS2 ship one; MSYS2's /c/msys64/usr/bin is first on the build PATH).
+    let out = std::process::Command::new("cygpath").args(["-m", printed]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let converted = String::from_utf8_lossy(&out.stdout);
+    let converted = converted.trim();
+    let path = std::path::PathBuf::from(converted);
     path.is_absolute().then_some(path)
 }

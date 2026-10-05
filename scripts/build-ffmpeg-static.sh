@@ -18,6 +18,7 @@
 set -euo pipefail
 
 FFMPEG_VERSION="${PPDRIVE_FFMPEG_VERSION:-9.0.2}"
+X264_VERSION="0.164.3108+git31e19f9"
 X265_VERSION="4.1"
 VPX_VERSION="1.15.0"
 AOM_VERSION="3.11.0"
@@ -110,13 +111,26 @@ fi
 mkdir -p "$PREFIX" "$DOWNLOADS"
 
 fetch() {
-    local url="$1" dest="$2"
+    local url="$1" dest="$2" attempt
     if [ -f "$dest" ]; then
         return 0
     fi
     echo "fetching $url"
-    curl -fsSL --retry 3 --retry-delay 2 -o "$dest.part" "$url"
-    mv "$dest.part" "$dest"
+    # Retry the whole download and verify it is a readable tarball: mirrors
+    # occasionally serve HTML error pages with HTTP 200 (code.videolan.org)
+    # or transient 5xx responses (aomedia googlesource).
+    for attempt in 1 2 3; do
+        if curl -fsSL --retry 5 --retry-delay 3 --connect-timeout 30 \
+            -o "$dest.part" "$url" &&
+            tar -tf "$dest.part" >/dev/null 2>&1; then
+            mv "$dest.part" "$dest"
+            return 0
+        fi
+        rm -f "$dest.part"
+        sleep $((attempt * 2))
+    done
+    echo "error: failed to fetch a valid archive from $url" >&2
+    exit 1
 }
 
 # extract <archive> <dir> [strip-components]
@@ -127,8 +141,10 @@ extract() {
     tar -xf "$archive" -C "$dir" --strip-components="$strip"
 }
 
-fetch "https://code.videolan.org/videolan/x264/-/archive/stable/x264-stable.tar.bz2" \
-    "$DOWNLOADS/x264-stable.tar.bz2"
+# Debian's pool: code.videolan.org serves HTML challenge pages to some
+# CI egress IPs, which saved fine and failed only at extract time.
+fetch "https://deb.debian.org/debian/pool/main/x/x264/x264_${X264_VERSION}.orig.tar.gz" \
+    "$DOWNLOADS/x264-${X264_VERSION}.tar.gz"
 fetch "https://deb.debian.org/debian/pool/main/x/x265/x265_${X265_VERSION}.orig.tar.xz" \
     "$DOWNLOADS/x265-${X265_VERSION}.tar.xz"
 fetch "https://github.com/webmproject/libvpx/archive/refs/tags/v${VPX_VERSION}.tar.gz" \
@@ -161,15 +177,15 @@ step_mark() {
     printf '%s' "$SCRIPT_KEY-$2" >"$PREFIX/.ppff-$1"
 }
 
-if ! step_done x264 stable; then
-    echo "==> x264 (static)"
-    extract "$DOWNLOADS/x264-stable.tar.bz2" "$WORK/x264"
+if ! step_done x264 "$X264_VERSION"; then
+    echo "==> x264 ${X264_VERSION} (static)"
+    extract "$DOWNLOADS/x264-${X264_VERSION}.tar.gz" "$WORK/x264"
     (cd "$WORK/x264" &&
         ./configure --prefix="$PREFIX" --enable-static --disable-shared \
             --enable-pic --disable-cli &&
         make -j"$JOBS" &&
         make install)
-    step_mark x264 stable
+    step_mark x264 "$X264_VERSION"
 fi
 
 if ! step_done x265 "$X265_VERSION"; then
@@ -178,6 +194,7 @@ if ! step_done x265 "$X265_VERSION"; then
     cmake -S "$WORK/x265/source" -B "$WORK/x265/build" -G "Unix Makefiles" \
         -DCMAKE_INSTALL_PREFIX="$PREFIX" \
         -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
         -DENABLE_SHARED=OFF \
         -DENABLE_CLI=OFF \
         -DENABLE_PIC=ON
