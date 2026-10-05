@@ -268,6 +268,7 @@ if ! step_done lame "$LAME_VERSION"; then
     extract "$DOWNLOADS/lame-${LAME_VERSION}.tar.gz" "$WORK/lame"
     (cd "$WORK/lame" &&
         ./configure --prefix="$PREFIX" --enable-static --disable-shared \
+            --disable-frontend \
             CFLAGS="${CFLAGS:--O2} -fPIC" &&
         make -j"$JOBS" &&
         make install)
@@ -287,6 +288,10 @@ fi
 if ! step_done libvorbis "$VORBIS_VERSION"; then
     echo "==> libvorbis ${VORBIS_VERSION} (static)"
     extract "$DOWNLOADS/libvorbis-${VORBIS_VERSION}.tar.xz" "$WORK/libvorbis"
+    # The darwin branch of configure adds -force_cpusubtype_ALL to CFLAGS,
+    # which Apple's modern ld rejects outright (it is an i386-era flag).
+    sed -i.bak 's/-force_cpusubtype_ALL//g' "$WORK/libvorbis/configure"
+    rm -f "$WORK/libvorbis/configure.bak"
     (cd "$WORK/libvorbis" &&
         ./configure --prefix="$PREFIX" --enable-static --disable-shared --with-pic &&
         make -j"$JOBS" &&

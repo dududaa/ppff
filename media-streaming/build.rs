@@ -8,7 +8,7 @@ const LIBRARIES: &[&str] = &["libavcodec", "libavformat", "libavutil"];
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../scripts/plugin-exports.rs");
-    emit_plugin_exports();
+    emit_static_runtime();
     println!("cargo:rerun-if-changed=src/ffi/wrapper.h");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     println!("cargo:rerun-if-env-changed=PPDRIVE_FFMPEG_STATIC");
