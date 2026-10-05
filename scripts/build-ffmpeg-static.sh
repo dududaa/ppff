@@ -191,6 +191,17 @@ fi
 if ! step_done x265 "$X265_VERSION"; then
     echo "==> x265 ${X265_VERSION} (static)"
     extract "$DOWNLOADS/x265-${X265_VERSION}.tar.xz" "$WORK/x265"
+    # CMake 4.x (Homebrew, MSYS2) rejects cmake_policy(SET ... OLD), which
+    # 4.1's CMakeLists does for CMP0025/CMP0054. Drop those lines and make
+    # the AppleClang check a substring match instead, which is exactly what
+    # the CMP0025 OLD behaviour ("report Apple's Clang as just Clang") did.
+    # Verified against cmake 4.0.3: configure + full build succeed.
+    sed -i.bak \
+        -e '/cmake_policy(SET CMP0025 OLD)/d' \
+        -e '/cmake_policy(SET CMP0054 OLD)/d' \
+        -e 's/CMAKE_CXX_COMPILER_ID} STREQUAL "Clang"/CMAKE_CXX_COMPILER_ID} MATCHES "Clang"/' \
+        "$WORK/x265/source/CMakeLists.txt"
+    rm -f "$WORK/x265/source/CMakeLists.txt.bak"
     cmake -S "$WORK/x265/source" -B "$WORK/x265/build" -G "Unix Makefiles" \
         -DCMAKE_INSTALL_PREFIX="$PREFIX" \
         -DCMAKE_BUILD_TYPE=Release \
