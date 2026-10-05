@@ -319,6 +319,13 @@ if ! step_done zlib "$ZLIB_VERSION"; then
     step_mark zlib "$ZLIB_VERSION"
 fi
 
+if [ "$IS_WINDOWS" -eq 1 ]; then
+    # FFmpeg's configure aborts with "Native MSYS builds are discouraged"
+    # when config.guess sees the plain msys environment; claiming the
+    # mingw64 environment makes it report x86_64-w64-mingw32 instead.
+    export MSYSTEM=MINGW64
+fi
+
 if ! step_done ffmpeg "$FFMPEG_VERSION"; then
     echo "==> FFmpeg ${FFMPEG_VERSION} (static, GPL)"
     extract "$DOWNLOADS/ffmpeg-${FFMPEG_VERSION}.tar.xz" "$WORK/ffmpeg"
