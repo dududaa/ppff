@@ -260,20 +260,13 @@ jobs:
               fi
               ;;
             *.dll)
-              # nm reports "no symbols" on stripped DLLs. Read the export
-              # name table instead — export-only: the full objdump -p output
-              # also lists imported names, and plugins legitimately import
+              # nm reports "no symbols" on stripped DLLs. Read objdump -p's
+              # export name table instead: entry lines are the only lines of
+              # the form "[ N] identifier" (imported names appear as
+              # "vma ordinal name" and are excluded by the end anchor), so
+              # this is export-only — plugins legitimately import
               # avcodec_open2.
-              syms="$(objdump -p "$f" | awk '
-                /^Export Address Table -- Name Pointer\/Ordinals/ {f = 1; next}
-                f && /^$/ {exit}
-                f {print}')"
-              if [ -z "$syms" ]; then
-                syms="$(objdump -p "$f" | awk '
-                  /Name Pointer\/Ordinals/ {f = 1; next}
-                  f && /^$/ {exit}
-                  f {print}')"
-              fi
+              syms="$(objdump -p "$f" | grep -E '^[[:space:]]*\[[0-9 ]+\][[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*$' || true)"
               ;;
             esac
             # macOS nm prefixes symbol names with "_", so allow an optional
