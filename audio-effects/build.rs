@@ -11,13 +11,11 @@ fn main() {
     emit_plugin_exports();
     println!("cargo:rerun-if-changed=src/ffi/wrapper.h");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
-    println!("cargo:rerun-if-env-changed=PPDRIVE_FFMPEG_STATIC");
 
     let mut include_paths: Vec<PathBuf> = Vec::new();
 
     for library in LIBRARIES {
-        let mut config = pkg_config::Config::new();
-        config.statik(env::var_os("PPDRIVE_FFMPEG_STATIC").is_some());
+        let config = pkg_config::Config::new();
         let lib = config.probe(library).unwrap_or_else(|e| {
             panic!(
                 "Failed to find {library} via pkg-config: {e}\n\

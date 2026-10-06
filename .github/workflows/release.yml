@@ -53,7 +53,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config nasm yasm cmake
+          sudo apt-get install -y pkg-config nasm yasm cmake patchelf
 
       - name: Install build tools (macOS)
         if: runner.os == 'macOS'
@@ -73,21 +73,22 @@ jobs:
             mingw-w64-x86_64-cmake `
             tar curl make perl
 
-      - name: Cache static FFmpeg
+      - name: Cache bundled FFmpeg
         uses: actions/cache@v4
         with:
           path: |
             ~/ppff-ffmpeg
             ~/ppff-ffmpeg-work/downloads
-          key: static-ffmpeg-${{ matrix.os_name }}-${{ matrix.arch }}-${{ hashFiles('scripts/build-ffmpeg-static.sh') }}
+          key: bundled-ffmpeg-${{ matrix.os_name }}-${{ matrix.arch }}-${{ hashFiles('scripts/build-ffmpeg-static.sh') }}
           restore-keys: |
+            bundled-ffmpeg-${{ matrix.os_name }}-${{ matrix.arch }}-
             static-ffmpeg-${{ matrix.os_name }}-${{ matrix.arch }}-
 
-      - name: Build static FFmpeg (Linux, macOS)
+      - name: Build bundled FFmpeg runtime (Linux, macOS)
         if: runner.os != 'Windows'
         run: ./scripts/build-ffmpeg-static.sh
 
-      - name: Build static FFmpeg (Windows/MSYS2)
+      - name: Build bundled FFmpeg runtime (Windows/MSYS2)
         if: runner.os == 'Windows'
         shell: C:\msys64\usr\bin\bash.exe {0}
         run: |
@@ -139,9 +140,13 @@ jobs:
             "ppdrive-video-transformation-${os}-${arch}.${lib_ext}"
           mv "target/release/${prefix}media_streaming.${lib_ext}" \
             "ppdrive-media-streaming-${os}-${arch}.${lib_ext}"
+
+          # The shared FFmpeg runtime: one bundle per platform that the
+          # plugin installer extracts into ppdrive's libs/ directory.
+          cp "${PPDRIVE_FFMPEG_RUNTIME_TAR:?runtime bundle missing}" .
           ls -la ppdrive-*
 
-      - name: Verify plugins are self-contained
+      - name: Verify plugins and runtime are relocatable
         shell: bash
         run: |
           set -euo pipefail
@@ -149,45 +154,197 @@ jobs:
             export PATH="/c/msys64/mingw64/bin:/c/msys64/usr/bin:$PATH"
           fi
           fail=0
-          for f in ppdrive-*; do
-            echo "== $f"
-            case "$f" in
-              *.so)
-                needs="$(readelf -d "$f" | grep NEEDED || true)"
-                syms="$(readelf --dyn-syms -W "$f" || true)"
-                ;;
-              *.dylib)
-                needs="$(otool -L "$f" | tail -n +2)"
-                syms=""
-                ;;
-              *.dll)
-                needs="$(objdump -p "$f" | grep 'DLL Name' || true)"
-                syms=""
-                ;;
-              *)
-                continue
+          err() { echo "ERROR: $*" >&2; fail=1; }
+
+          # Emit one bare dependency name per line.
+          needs_of() {
+            case "$1" in
+            *.so) readelf -d "$1" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' ;;
+            *.dylib) otool -L "$1" | tail -n +2 | awk '{print $1}' ;;
+            *.dll) objdump -p "$1" | sed -n 's/.*DLL Name: //p' ;;
+            esac
+          }
+
+          # Codecs and host C/C++ runtimes that must never appear as a
+          # dependency: everything here is either bundled *inside* the
+          # runtime's dylibs or belongs to a host we must not require.
+          deny_re='libx264|libx265|libvpx|libaom|libwebp|libmp3lame|libvorbis|libopus|libogg|libz\.so|zlib1|libX11|libxcb|libbz2|liblzma|libstdc\+\+|libgcc_s|libgcc_eh|libwinpthread'
+          system_re='^libc\.so|^libm\.so|^libmvec|^libpthread|^libdl|^librt\.so|^ld-linux|^ld64|^libSystem|^kernel32|^msvcrt|^ntdll|^user32|^advapi32|^shell32|^ws2_32|^ucrtbase|^vcruntime|^api-ms-win|^bcrypt|^ole32|^shlwapi|^winmm|^psapi|^version'
+
+          # Deps allowed in shipped artifacts: the bundled runtime's own
+          # six libraries (plugins reference them; the runtime references
+          # itself), known OS libraries, and on macOS anything the platform
+          # owns under /usr/lib (dyld shared cache).
+          allowed_dep() {
+            local dep="$1"
+            case "$dep" in
+            *libav* | *libsw* | avcodec-* | avformat-* | avutil-* | avfilter-* | swscale-* | swresample-*)
+                return 0
                 ;;
             esac
-            echo "$needs"
-            if echo "$needs" | grep -Eiq \
-              'libav|libsw|libx264|libx265|libvpx|libaom|libwebp|libmp3lame|libvorbis|libopus|libogg|libz\.so|zlib1|libstdc\+\+|libgcc_s|libX11|libxcb|libbz2|liblzma|avcodec|avformat|avutil|avfilter|swscale|swresample'; then
-              echo "ERROR: $f still depends on external media libraries" >&2
-              fail=1
+            if [ "$RUNNER_OS" = "macOS" ]; then
+                case "$dep" in
+                /usr/lib/*) return 0 ;;
+                esac
             fi
-            if [ -n "$syms" ]; then
-              if ! echo "$syms" | grep -qw plugin_dispatch; then
-                echo "ERROR: $f does not export plugin_dispatch" >&2
-                fail=1
+            echo "$dep" | grep -Eiq "$system_re"
+          }
+
+          # --- runtime bundle: six FFmpeg libraries, OS deps only ---
+          mkdir -p runtime-check
+          tar -xzf ppdrive-media-runtime-*.tar.gz -C runtime-check
+          count="$(find runtime-check -type f | wc -l)"
+          [ "$count" -eq 6 ] || err "runtime bundle has $count files, expected 6"
+          echo "== runtime bundle contents"
+          ls -la runtime-check
+          for f in runtime-check/*; do
+            echo "== runtime $(basename "$f")"
+            while IFS= read -r dep; do
+              [ -n "$dep" ] || continue
+              echo "  needs: $dep"
+              if echo "$dep" | grep -Eiq "$deny_re"; then
+                err "runtime $(basename "$f") depends on $dep"
+              elif ! allowed_dep "$dep"; then
+                err "runtime $(basename "$f") has unexpected dep $dep"
               fi
-              if echo "$syms" | grep -qw avcodec_open2; then
-                echo "ERROR: $f leaks FFmpeg symbols" >&2
-                fail=1
-              fi
-              # Report the glibc floor (informational; built on 22.04 → ≤2.35).
-              echo -n "highest GLIBC symbol version: "
-              objdump -T "$f" | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1 || true
+            done < <(needs_of "$f")
+            if [ "$RUNNER_OS" = "macOS" ] && otool -L "$f" | grep -q "ppff-ffmpeg"; then
+              err "runtime $(basename "$f") records a build-time path"
             fi
           done
+
+          # --- plugins: bind to the bundled runtime, export only the
+          # ppdrive entry point, carry no FFmpeg code of their own ---
+          for f in ppdrive-*; do
+            case "$f" in
+            *.so | *.dylib | *.dll) ;;
+            *) continue ;;
+            esac
+            echo "== plugin $f"
+            has_av=0
+            while IFS= read -r dep; do
+              [ -n "$dep" ] || continue
+              echo "  needs: $dep"
+              case "$dep" in
+              *libav* | *libsw* | avcodec-* | avformat-* | avutil-* | avfilter-* | swscale-* | swresample-*)
+                has_av=1
+                ;;
+              esac
+              if echo "$dep" | grep -Eiq "$deny_re"; then
+                err "plugin $f depends on $dep"
+              elif ! allowed_dep "$dep"; then
+                err "plugin $f has unexpected dep $dep"
+              fi
+            done < <(needs_of "$f")
+            [ "$has_av" -eq 1 ] || err "plugin $f has no FFmpeg runtime dependency"
+            size="$(wc -c <"$f")"
+            if [ "$size" -gt 15728640 ]; then
+              err "plugin $f is $size bytes (>15 MiB): FFmpeg got linked in?"
+            fi
+            case "$f" in
+            *.so)
+              syms="$(readelf --dyn-syms -W "$f" | grep -v ' UND ' || true)"
+              echo -n "  highest GLIBC symbol version: "
+              objdump -T "$f" | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1 || true
+              ;;
+            *.dylib)
+              syms="$(nm -gU "$f" || true)"
+              if otool -L "$f" | grep -q "ppff-ffmpeg"; then
+                err "plugin $f records a build-time path"
+              fi
+              ;;
+            *.dll)
+              syms="$(nm --defined-only -g "$f" || true)"
+              ;;
+            esac
+            if ! echo "$syms" | grep -qw plugin_dispatch; then
+              err "plugin $f does not export plugin_dispatch"
+            fi
+            # A defined avcodec_open2 would mean a private FFmpeg copy got
+            # linked in (undefined references to it are expected).
+            if echo "$syms" | grep -qw avcodec_open2; then
+              err "plugin $f defines FFmpeg symbols"
+            fi
+          done
+
+          # --- dlopen smoke: reproduce ppdrive's load conditions ---
+          # The smoke dir mirrors ppdrive's libs/ layout: plugins next to
+          # the runtime, resolved via the plugin's own $ORIGIN/@loader_path
+          # rpath (and, on Windows, LOAD_WITH_ALTERED_SEARCH_PATH exactly
+          # like ppdrive/core's loader).
+          mkdir -p smoke
+          case "$RUNNER_OS" in
+          Windows)
+            cp ppdrive-*.dll smoke/
+            plugins=(smoke/ppdrive-*.dll)
+            ;;
+          macOS)
+            cp ppdrive-*.dylib smoke/
+            plugins=(smoke/ppdrive-*.dylib)
+            ;;
+          *)
+            cp ppdrive-*.so smoke/
+            plugins=(smoke/ppdrive-*.so)
+            ;;
+          esac
+          cp runtime-check/* smoke/
+          cat >smoke/load.c <<'EOF'
+          #include <stdio.h>
+          #include <string.h>
+          #ifdef _WIN32
+          #include <windows.h>
+          static void *load_lib(const char *p) {
+            char full[4096];
+            if (!GetFullPathNameA(p, sizeof full, full, NULL)) return NULL;
+            return (void *)LoadLibraryExA(full, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+          }
+          static void *get_sym(void *h, const char *n) { return (void *)GetProcAddress((HMODULE)h, n); }
+          static const char *load_err(void) { static char b[64]; sprintf(b, "win32 error %lu", GetLastError()); return b; }
+          #else
+          #include <dlfcn.h>
+          static void *load_lib(const char *p) { return dlopen(p, RTLD_NOW | RTLD_LOCAL); }
+          static void *get_sym(void *h, const char *n) { return dlsym(h, n); }
+          static const char *load_err(void) { return dlerror(); }
+          #endif
+          int main(int argc, char **argv) {
+            void *h;
+            if (argc < 2) return 2;
+            h = load_lib(argv[1]);
+            if (!h) { fprintf(stderr, "load failed: %s\n", load_err()); return 1; }
+            if (!get_sym(h, "plugin_dispatch")) { fprintf(stderr, "missing plugin_dispatch\n"); return 1; }
+            printf("loaded %s ok\n", argv[1]);
+          #ifdef __linux__
+            if (argc >= 3) {
+              int maps = 0;
+              char line[4096];
+              FILE *m;
+              void *h2 = load_lib(argv[2]);
+              if (!h2) { fprintf(stderr, "second load failed: %s\n", load_err()); return 1; }
+              m = fopen("/proc/self/maps", "r");
+              /* Count executable segments: each mapped library instance has
+                 exactly one r-xp mapping, so two copies of libavcodec (from
+                 two different paths) would report 2. */
+              while (m && fgets(line, sizeof line, m))
+                if (strstr(line, "libavcodec.so") && strstr(line, " r-xp ")) maps++;
+              if (m) fclose(m);
+              printf("libavcodec executable mappings with %d plugins loaded: %d\n", argc - 1, maps);
+              if (maps != 1) { fprintf(stderr, "expected 1 shared libavcodec mapping, got %d\n", maps); return 1; }
+            }
+          #endif
+            return 0;
+          }
+          EOF
+          extra_ld=""
+          if [ "$RUNNER_OS" = "Linux" ]; then extra_ld="-ldl"; fi
+          if cc -o smoke/load smoke/load.c $extra_ld; then
+            if [ "$RUNNER_OS" = "Linux" ] && [ "${#plugins[@]}" -ge 2 ]; then
+              ./smoke/load "${plugins[0]}" "${plugins[1]}"
+            else
+              ./smoke/load "${plugins[0]}"
+            fi
+          else
+            err "smoke loader failed to compile"
+          fi
           exit $fail
 
       - uses: actions/upload-artifact@v4
@@ -230,6 +387,12 @@ jobs:
         with:
           name: ppdrive-media-streaming-${{ matrix.os_name }}-${{ matrix.arch }}
           path: ppdrive-media-streaming-${{ matrix.os_name }}-${{ matrix.arch }}.*
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ppdrive-media-runtime-${{ matrix.os_name }}-${{ matrix.arch }}
+          path: ppdrive-media-runtime-${{ matrix.os_name }}-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
   release:

@@ -8,17 +8,15 @@ const LIBRARIES: &[&str] = &["libavcodec", "libavformat", "libavutil"];
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../scripts/plugin-exports.rs");
-    emit_static_runtime();
+    emit_bundled_runtime();
     println!("cargo:rerun-if-changed=src/ffi/wrapper.h");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
-    println!("cargo:rerun-if-env-changed=PPDRIVE_FFMPEG_STATIC");
 
     let mut include_paths: Vec<PathBuf> = Vec::new();
     let mut lavf_major: Option<u32> = None;
 
     for library in LIBRARIES {
-        let mut config = pkg_config::Config::new();
-        config.statik(env::var_os("PPDRIVE_FFMPEG_STATIC").is_some());
+        let config = pkg_config::Config::new();
         let lib = config.probe(library).unwrap_or_else(|e| {
             panic!(
                 "Failed to find {library} via pkg-config: {e}\n\

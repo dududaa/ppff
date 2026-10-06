@@ -11,20 +11,24 @@ FFmpeg, x264, x265 and libvorbis are licensed under **GPL-2.0-or-later**, so thi
 License v2.0 or later. See [LICENSE](LICENSE). PPDRIVE's core stays under the PolyForm Noncommercial license; the
 plugins are separate works connected to it only at runtime through the `plugin_dispatch` entry point.
 
-## Self-contained plugin releases
+## Shared FFmpeg runtime
 
-The `Release` workflow builds [FFmpeg](https://ffmpeg.org/) 9 with x264, x265, libvpx, libaom, libwebp, lame,
-libogg, libvorbis, libopus and zlib via `scripts/build-ffmpeg-static.sh`, then links every plugin against that
-static prefix (`PPDRIVE_FFMPEG_STATIC=1`). Released `ppdrive-*` assets therefore carry their own copy of FFmpeg
-and the codecs: no `libav*`/codec `DT_NEEDED` entries, only `plugin_dispatch` exported, and they load on any host
-regardless of the FFmpeg version installed there. A verification step fails the release if an external media
-library dependency slips back in.
+The `Release` workflow builds [FFmpeg](https://ffmpeg.org/) 9 as six shared libraries via
+`scripts/build-ffmpeg-static.sh`, with x264, x265, libvpx, libaom, libwebp, lame, libogg, libvorbis, libopus
+and zlib linked **statically inside them** (the host C/C++ runtimes too). Each platform gets one
+`ppdrive-media-runtime-<os>-<arch>.tar.gz` bundle holding those six libraries, while every `ppdrive-*` plugin
+stays thin (~0.5 MB): it carries no FFmpeg code of its own, exports only `plugin_dispatch`, and resolves the
+runtime next to itself through an `$ORIGIN`/`@loader_path` rpath (on Windows, ppdrive's loader opens plugins
+with `LOAD_WITH_ALTERED_SEARCH_PATH`). `ppdrive plugin add` extracts the runtime bundle into ppdrive's `libs/`
+directory, so hosts need no system FFmpeg and all installed plugins share one runtime mapping. A verification
+step fails the release if a codec or host-runtime dependency slips into a shipped artifact, if a plugin
+defines FFmpeg symbols, or if two plugins would not share a single `libavcodec` mapping.
 
 To reproduce locally:
 
 ```sh
-./scripts/build-ffmpeg-static.sh          # installs to ~/ppff-ffmpeg
+./scripts/build-ffmpeg-static.sh   # builds into ~/ppff-ffmpeg and prints the env exports
 export PKG_CONFIG_PATH=~/ppff-ffmpeg/lib/pkgconfig
-export PPDRIVE_FFMPEG_STATIC=1
+export LD_LIBRARY_PATH=~/ppff-ffmpeg/lib
 cargo build --release --workspace
 ```

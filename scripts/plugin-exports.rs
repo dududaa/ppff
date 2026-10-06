@@ -1,12 +1,14 @@
 // Shared by every plugin cdylib's build.rs via include!().
 //
-// A statically linked FFmpeg puts a private copy of every av_* symbol into
-// each plugin. Exporting those would let one plugin's copies interpose
-// another's when several plugins live in the same process, so restrict the
-// dynamic symbol table to the single entry point ppdrive dlopens.
+// Plugins link dynamically against the bundled FFmpeg runtime (built by
+// build-ffmpeg-static.sh) which ships next to them in ppdrive's libs/
+// directory, so every plugin in a process shares one copy of FFmpeg and no
+// host FFmpeg is ever consulted. Only the ppdrive entry point is exported;
+// everything else stays hidden so plugins cannot interpose each other (or
+// the runtime's own av_* symbols, which remain undefined here).
 
 // The lib-only packages (which never build a cdylib) include this file for
-// emit_static_runtime() alone, so allow emit_plugin_exports to go unused.
+// emit_bundled_runtime() alone, so allow emit_plugin_exports to go unused.
 #[allow(dead_code)]
 fn emit_plugin_exports() {
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
@@ -22,10 +24,10 @@ fn emit_plugin_exports() {
                 "cargo:rustc-cdylib-link-arg=-Wl,--version-script={}",
                 map.display()
             );
-            emit_static_runtime();
+            emit_bundled_runtime();
         }
         "windows" => {
-            emit_static_runtime();
+            emit_bundled_runtime();
         }
         "macos" | "ios" => {
             let list = out.join("plugin-exports.list");
@@ -34,40 +36,46 @@ fn emit_plugin_exports() {
                 "cargo:rustc-cdylib-link-arg=-Wl,-exported_symbols_list,{}",
                 list.display()
             );
+            emit_bundled_runtime();
         }
         _ => {}
     }
 }
 
-// x265 is C++, so a static FFmpeg drags the C++ runtime into the link.
-// gcc's -static-libstdc++/-static-libgcc only rewrite *implicit* runtime
-// libs, and explicit -lstdc++ (which pkg-config used to inject) would win
-// over them, so hand the static archives to the linker as inputs.
-// The .pc files are stripped of -lstdc++/-lgcc* by build-ffmpeg-static.sh.
-// rustc-link-arg (not cdylib-link-arg) so test/example binaries that link
-// the av* static libs resolve the C++ runtime too.
-fn emit_static_runtime() {
+// Resolve the bundled runtime sitting next to the plugin (or, for local
+// test binaries, use LD_LIBRARY_PATH=<prefix>/lib):
+// - ELF: DT_RUNPATH=$ORIGIN finds libavcodec.so.NN and friends in the
+//   directory of the loading object.
+// - macOS: LC_RPATH=@loader_path plus the @rpath dylib ids that
+//   build-ffmpeg-static.sh writes.
+// - Windows: no rpath concept; the ppdrive loader opens plugins with
+//   LOAD_WITH_ALTERED_SEARCH_PATH so the av*-NN.dll files next to the
+//   plugin are searched for it and its dependencies.
+// A rpath to the build prefix is deliberately NOT baked in: shipped
+// artifacts must resolve the runtime only from their own directory.
+fn emit_bundled_runtime() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if target_os == "macos" || target_os == "ios" {
-        // Apple's clang links the system libc++, which x265 is built
-        // against there, and there is no libgcc to pin down.
-        return;
-    }
-    println!("cargo:rustc-link-arg=-static-libstdc++");
-    println!("cargo:rustc-link-arg=-static-libgcc");
-    for archive in ["libstdc++.a", "libgcc.a", "libgcc_eh.a"] {
-        if let Some(path) = gxx_print_file_name(archive) {
-            println!("cargo:rustc-link-arg={}", path.display());
+    match target_os.as_str() {
+        "linux" | "freebsd" | "netbsd" | "openbsd" | "android" => {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
         }
+        "macos" | "ios" => {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,@loader_path");
+        }
+        _ => {}
     }
+
     // rustc always puts an explicit -lgcc_s in the native lib list of GNU
-    // targets, before our archives are considered, so ld binds the unwind
-    // symbols to libgcc_s.so.1 and records a DT_NEEDED for it (verified
-    // against GNU ld). Shadow the system library with a static libgcc_s.a
-    // in a search path we control: ld tries every -L directory regardless
-    // of where it appears on the command line, and archives never produce
-    // DT_NEEDED entries.
-    if let Some(libgcc) = gxx_print_file_name("libgcc.a") {
+    // targets, which would record DT_NEEDED libgcc_s.so.1. Shadow the system
+    // library with a static archive in a search path we control: ld tries
+    // every -L directory regardless of where it appears on the command line,
+    // and archives never produce DT_NEEDED entries. The archive must actually
+    // contain the _Unwind_* symbols rustc references: on ELF toolchains that
+    // is libgcc_eh.a (libgcc.a holds almost none of them), while mingw keeps
+    // them in libgcc.a — so probe with nm instead of guessing.
+    if target_os != "macos" && target_os != "ios"
+        && let Some(libgcc) = static_libgcc_s_source()
+    {
         let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
         let shim = out.join("gccshim");
         let _ = std::fs::create_dir_all(&shim);
@@ -77,28 +85,31 @@ fn emit_static_runtime() {
             println!("cargo:rustc-link-search={}", shim.display());
         }
     }
-    if target_os == "windows" {
-        // Our archives are link-args, so they come after rustc's mingw
-        // native libs (libmingwex, libmingw32, msvcrt, kernel32, ...) and
-        // libstdc++.a's references to pthread_*, _tls_index and the CRT
-        // import thunks would dangle; static archives are only scanned
-        // once, at their position. Re-list the providers after the
-        // archives, as g++'s own driver line does. Force the static
-        // libpthread.a (same -l: spelling rustc uses) so the DLL does not
-        // pick up a libwinpthread dependency.
-        println!("cargo:rustc-link-arg=-Wl,--start-group");
-        for lib in [
-            "-l:libpthread.a",
-            "-lmingwex",
-            "-lmingw32",
-            "-lmsvcrt",
-            "-lkernel32",
-            "-lntdll",
-        ] {
-            println!("cargo:rustc-link-arg={lib}");
+}
+
+fn static_libgcc_s_source() -> Option<std::path::PathBuf> {
+    for candidate in ["libgcc_eh.a", "libgcc.a"] {
+        if let Some(path) = gxx_print_file_name(candidate)
+            && archive_contains(&path, "_Unwind_GetIP")
+        {
+            return Some(path);
         }
-        println!("cargo:rustc-link-arg=-Wl,--end-group");
     }
+    None
+}
+
+fn archive_contains(archive: &std::path::Path, symbol: &str) -> bool {
+    let Ok(out) = std::process::Command::new("nm")
+        .arg("--defined-only")
+        .arg(archive)
+        .output()
+    else {
+        return false;
+    };
+    out.stdout
+        .split(|b| *b == b'\n')
+        .filter_map(|line| std::str::from_utf8(line).ok())
+        .any(|line| line.split_whitespace().any(|tok| tok == symbol))
 }
 
 fn gxx_print_file_name(archive: &str) -> Option<std::path::PathBuf> {

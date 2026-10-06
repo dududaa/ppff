@@ -1,20 +1,23 @@
 #!/usr/bin/env bash
-# Build a self-contained static FFmpeg toolchain (plus x264, x265, libvpx,
-# libaom, libwebp, lame, libogg, libvorbis and libopus) into
+# Build the bundled media runtime: a shared FFmpeg toolchain (plus x264,
+# x265, libvpx, libaom, libwebp, lame, libogg, libvorbis and libopus, which
+# stay static and are linked *inside* the FFmpeg dylibs) into
 # $PPDRIVE_FFMPEG_PREFIX.
 #
-# The ppff media plugins are then linked against this prefix with
-# PPDRIVE_FFMPEG_STATIC=1, so the shipped plugin libraries carry no
-# libav*/libx264/... DT_NEEDED entries and load on any host regardless of
-# the FFmpeg version installed there.
-#
-# Prerequisites: cc/c++, make, perl, pkg-config; nasm + yasm on x86 hosts;
-# cmake for x265 and aom. On Windows run from an MSYS2 shell with the
-# mingw-w64 toolchain on PATH.
+# The ppff media plugins link dynamically against this prefix
+# (PKG_CONFIG_PATH) with an $ORIGIN/@loader_path rpath, so every plugin in a
+# process shares ONE copy of FFmpeg and no host FFmpeg is ever consulted:
+# the plugin's DT_RUNPATH finds the bundled runtime next to it in ppdrive's
+# libs/ directory.
 #
 # On success the script exports (and appends to $GITHUB_ENV when set):
 #   PKG_CONFIG_PATH=<prefix>/lib/pkgconfig
-#   PPDRIVE_FFMPEG_STATIC=1
+#   LD_LIBRARY_PATH=<prefix>/lib            (local test runs)
+#   PPDRIVE_FFMPEG_RUNTIME_TAR=<prefix>/ppdrive-media-runtime-<os>-<arch>.tar.gz
+#
+# Prerequisites: cc/c++, make, perl, pkg-config; nasm + yasm on x86 hosts;
+# cmake for x265 and aom; patchelf on Linux. On Windows run from an MSYS2
+# shell with the mingw-w64 toolchain on PATH.
 set -euo pipefail
 
 FFMPEG_VERSION="${PPDRIVE_FFMPEG_VERSION:-9.0.2}"
@@ -41,6 +44,17 @@ case "$UNAME" in
     *) IS_WINDOWS=0 ;;
 esac
 ARCH="$(uname -m)"
+case "$UNAME" in
+    Darwin) OS_NAME="macos" ;;
+    MINGW* | MSYS* | CYGWIN*) OS_NAME="windows" ;;
+    *) OS_NAME="linux" ;;
+esac
+case "$ARCH" in
+    arm64) ARCH_NAME="aarch64" ;;
+    amd64) ARCH_NAME="x86_64" ;;
+    *) ARCH_NAME="$ARCH" ;;
+esac
+RUNTIME_TAR="$PREFIX/ppdrive-media-runtime-${OS_NAME}-${ARCH_NAME}.tar.gz"
 
 if [ "$IS_WINDOWS" -eq 0 ]; then
     JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
@@ -67,21 +81,30 @@ pkg_config_path_for() {
 }
 
 emit_env() {
-    local pc
+    local pc tar
     pc="$(pkg_config_path_for "$PREFIX")"
+    tar="$RUNTIME_TAR"
+    if [ "$IS_WINDOWS" -eq 1 ]; then
+        # Export a Windows-style path: later workflow steps run in Git
+        # Bash, which cannot see MSYS2's /home/... tree.
+        tar="$(cd "$PREFIX" && pwd -W)/$(basename "$RUNTIME_TAR")"
+        tar="${tar//\\//}"
+    fi
     echo "PKG_CONFIG_PATH=$pc${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-    echo "PPDRIVE_FFMPEG_STATIC=1"
+    echo "LD_LIBRARY_PATH=$PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    echo "PPDRIVE_FFMPEG_RUNTIME_TAR=$tar"
     if [ -n "${GITHUB_ENV:-}" ]; then
         {
             echo "PKG_CONFIG_PATH=$pc"
-            echo "PPDRIVE_FFMPEG_STATIC=1"
+            echo "LD_LIBRARY_PATH=$PREFIX/lib"
+            echo "PPDRIVE_FFMPEG_RUNTIME_TAR=$tar"
         } >>"$GITHUB_ENV"
     fi
 }
 
-MARKER_VALUE="$SCRIPT_KEY-ffmpeg-$FFMPEG_VERSION"
-if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$MARKER_VALUE" ]; then
-    echo "Static FFmpeg already built at $PREFIX"
+MARKER_VALUE="$SCRIPT_KEY-ffmpeg-$FFMPEG_VERSION-shared"
+if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$MARKER_VALUE" ] && [ -f "$RUNTIME_TAR" ]; then
+    echo "Bundled FFmpeg runtime already built at $PREFIX"
     emit_env
     exit 0
 fi
@@ -91,6 +114,9 @@ need make
 need pkg-config
 need perl
 need cmake
+if [ "$IS_WINDOWS" -eq 0 ] && [ "$UNAME" != "Darwin" ]; then
+    need patchelf
+fi
 case "$ARCH" in
     x86_64 | amd64)
         need nasm
@@ -326,12 +352,67 @@ if [ "$IS_WINDOWS" -eq 1 ]; then
     export MSYSTEM=MINGW64
 fi
 
-if ! step_done ffmpeg "$FFMPEG_VERSION"; then
-    echo "==> FFmpeg ${FFMPEG_VERSION} (static, GPL)"
+# FFmpeg's configure hardcodes -lstdc++ wherever x265 is enabled, so the
+# shared libavcodec would record DT_NEEDED libstdc++.so.6 (or link the
+# libstdc++-6.dll import library on Windows) and every plugin loading it
+# would depend on a C++ runtime the host may not have. Make -lstdc++ resolve
+# to the *static* archive inside $PREFIX/lib, which is searched before the
+# system directories: on ELF a linker script named libstdc++.so points at the
+# archive, on mingw the import library is shadowed by a copy of the static
+# archive (import libs lose to .a files only by name, so overwrite the name
+# ld prefers). x265's symbols then end up embedded in libavcodec with no
+# runtime dependency. -static-libgcc in the FFmpeg link does the same for the
+# gcc unwinder.
+setup_stdcpp_shadow() {
+    if [ "$UNAME" = "Darwin" ]; then
+        # x265 links the system libc++, which every macOS ships.
+        return 0
+    fi
+    local archive
+    archive="$("${CXX:-c++}" -print-file-name=libstdc++.a)"
+    if [ "$archive" = "libstdc++.a" ] || [ ! -f "$archive" ]; then
+        echo "error: static libstdc++.a not found; runtime would depend on libstdc++.so.6" >&2
+        exit 1
+    fi
+    if [ "$IS_WINDOWS" -eq 1 ]; then
+        cp -f "$archive" "$PREFIX/lib/libstdc++.dll.a"
+    else
+        printf 'INPUT ( %s )\n' "$archive" >"$PREFIX/lib/libstdc++.so"
+    fi
+}
+
+if ! step_done ffmpeg "$FFMPEG_VERSION-shared"; then
+    echo "==> FFmpeg ${FFMPEG_VERSION} (shared runtime, GPL)"
+    # Drop outputs of a previous static build in this prefix so the shared
+    # install cannot pick up stale archives.
+    rm -f "$PREFIX"/lib/libavcodec.* "$PREFIX"/lib/libavformat.* \
+        "$PREFIX"/lib/libavfilter.* "$PREFIX"/lib/libavutil.* \
+        "$PREFIX"/lib/libavdevice.* "$PREFIX"/lib/libswscale.* \
+        "$PREFIX"/lib/libswresample.*
+    setup_stdcpp_shadow
+    # The .pc sed below (which keeps -lstdc++ out of *plugin* link lines)
+    # may already have run against this prefix in an earlier invocation:
+    # restore it for the x265 probe, which needs -lstdc++ on its link line
+    # to resolve x265's C++ runtime (via the static shadow above). It gets
+    # stripped again once FFmpeg is installed. Placed at the end of
+    # Libs.private so it (a) lands after -lx265 where GNU ld's one-pass
+    # archive resolution can use it, and (b) is only emitted for the
+    # --static probes FFmpeg runs, never for plugin link lines.
+    sed -i \
+        -e 's/ -lstdc++//g' \
+        -e 's/^Libs.private: \(.*\)$/Libs.private: \1 -lstdc++/' \
+        "$PREFIX/lib/pkgconfig/x265.pc"
+    case "$UNAME" in
+    Darwin) RUNTIME_LDFLAGS="-L$PREFIX/lib -Wl,-rpath,@loader_path" ;;
+    # No $ORIGIN here: FFmpeg's configure runs add_ldflags through eval and
+    # would expand it as a shell variable. The Linux rpath is stamped onto
+    # the installed libraries with patchelf after `make install`.
+    *) RUNTIME_LDFLAGS="-L$PREFIX/lib -static-libstdc++ -static-libgcc" ;;
+    esac
     extract "$DOWNLOADS/ffmpeg-${FFMPEG_VERSION}.tar.xz" "$WORK/ffmpeg"
     (cd "$WORK/ffmpeg" &&
         ./configure --prefix="$PREFIX" \
-            --enable-static --disable-shared --enable-pic \
+            --disable-static --enable-shared --enable-pic \
             --enable-gpl \
             --enable-libx264 --enable-libx265 --enable-libvpx \
             --enable-libaom --enable-libwebp --enable-libmp3lame \
@@ -340,23 +421,93 @@ if ! step_done ffmpeg "$FFMPEG_VERSION"; then
             --disable-xlib --disable-libxcb \
             --disable-bzlib --disable-lzma \
             --extra-cflags="-I$PREFIX/include" \
-            --extra-ldflags="-L$PREFIX/lib" \
+            --extra-ldflags="$RUNTIME_LDFLAGS" \
             --pkg-config-flags="--static" &&
         make -j"$JOBS" &&
         make install)
-    step_mark ffmpeg "$FFMPEG_VERSION"
+    # Linux: stamp DT_RUNPATH=$ORIGIN so each of the six libraries resolves
+    # its siblings inside ppdrive's libs/ directory (patchelf instead of
+    # --extra-ldflags because configure's eval would eat the $ORIGIN).
+    if [ "$UNAME" != "Darwin" ] && [ "$IS_WINDOWS" -eq 0 ]; then
+        for l in libavcodec libavformat libavfilter libavutil libswscale libswresample; do
+            real="$(realpath "$PREFIX/lib/$l.so")"
+            patchelf --set-rpath '$ORIGIN' "$real"
+        done
+    fi
+    # macOS: FFmpeg bakes the build machine's absolute install paths into
+    # the dylib ids and into the cross-references between the six libraries.
+    # Rewrite them so the runtime is relocatable: @rpath ids for consumers
+    # (plugins), @loader_path references between the runtime's own dylibs.
+    if [ "$UNAME" = "Darwin" ]; then
+        libs="libavcodec libavformat libavfilter libavutil libswscale libswresample"
+        names=""
+        for l in $libs; do
+            link="$(readlink "$PREFIX/lib/$l.dylib" || true)"
+            base="${link:-$l.dylib}"
+            install_name_tool -id "@rpath/$base" "$PREFIX/lib/$base"
+            names="$names $base"
+        done
+        for l in $libs; do
+            link="$(readlink "$PREFIX/lib/$l.dylib" || true)"
+            base="${link:-$l.dylib}"
+            real="$PREFIX/lib/$base"
+            for dep in $names; do
+                install_name_tool -change "$PREFIX/lib/$dep" "@rpath/$dep" \
+                    "$real" 2>/dev/null || true
+            done
+            if ! otool -l "$real" | grep -q "@loader_path"; then
+                install_name_tool -add_rpath "@loader_path" "$real"
+            fi
+        done
+    fi
+    step_mark ffmpeg "$FFMPEG_VERSION-shared"
 fi
 
-# FFmpeg's configure bakes -lstdc++/-lgcc* into libavcodec.pc and x265.pc so
-# *shared* consumers pick up a C++ runtime. An explicit -lstdc++ would defeat
-# gcc's -static-libstdc++ (it only rewrites implicit runtime libs), and these
-# runtimes must stay private to the plugin anyway: the cdylib build.rs hands
-# the static archives to the linker directly.
+# FFmpeg's configure bakes -lstdc++/-lgcc* into its .pc files so *shared*
+# consumers would pick up a C++ runtime. Plugins only link the av*/sw*
+# dylibs, never -lstdc++, so strip those entries for them (the runtime
+# itself resolved libstdc++ via the shadow above, at its own link).
 for pc in "$PREFIX"/lib/pkgconfig/*.pc; do
     sed -i.bak 's/-lstdc++//g; s/-lgcc_s//g; s/-lgcc//g' "$pc"
     rm -f "$pc.bak"
 done
 
+# Stage the runtime: the six FFmpeg libraries under the exact names the
+# plugins will reference (SONAME on ELF, @rpath basename on macOS, plain
+# DLL names on Windows), bundled into one relocatable tarball the release
+# ships and ppdrive's plugin installer extracts into libs/.
+stage_runtime() {
+    local staging lib soname base
+    staging="$PREFIX/runtime-staging"
+    rm -rf "$staging"
+    mkdir -p "$staging"
+    if [ "$IS_WINDOWS" -eq 1 ]; then
+        for lib in avcodec avformat avfilter avutil swscale swresample; do
+            cp "$PREFIX"/bin/"$lib"-*.dll "$staging"/
+        done
+    elif [ "$UNAME" = "Darwin" ]; then
+        for lib in libavcodec libavformat libavfilter libavutil libswscale libswresample; do
+            link="$(readlink "$PREFIX/lib/$lib.dylib" || true)"
+            base="${link:-$lib.dylib}"
+            cp -L "$PREFIX/lib/$lib.dylib" "$staging/$base"
+        done
+    else
+        for lib in libavcodec libavformat libavfilter libavutil libswscale libswresample; do
+            soname="$(readelf -d "$PREFIX/lib/$lib.so" |
+                sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p')"
+            [ -n "$soname" ] || {
+                echo "error: no SONAME for $lib.so" >&2
+                exit 1
+            }
+            cp -L "$PREFIX/lib/$lib.so" "$staging/$soname"
+        done
+    fi
+    tar -czf "$RUNTIME_TAR" -C "$staging" .
+    echo "==> Runtime bundle: $RUNTIME_TAR"
+    tar -tzf "$RUNTIME_TAR"
+}
+stage_runtime
+
 printf '%s' "$MARKER_VALUE" >"$MARKER"
-echo "==> Static FFmpeg toolchain installed at $PREFIX"
+echo "==> Bundled FFmpeg runtime installed at $PREFIX"
 emit_env
