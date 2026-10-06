@@ -398,10 +398,12 @@ if ! step_done ffmpeg "$FFMPEG_VERSION-shared"; then
     # Libs.private so it (a) lands after -lx265 where GNU ld's one-pass
     # archive resolution can use it, and (b) is only emitted for the
     # --static probes FFmpeg runs, never for plugin link lines.
-    sed -i \
+    # -i.bak (not -i): BSD sed on macOS requires the backup suffix attached.
+    sed -i.bak \
         -e 's/ -lstdc++//g' \
         -e 's/^Libs.private: \(.*\)$/Libs.private: \1 -lstdc++/' \
         "$PREFIX/lib/pkgconfig/x265.pc"
+    rm -f "$PREFIX/lib/pkgconfig/x265.pc.bak"
     case "$UNAME" in
     Darwin) RUNTIME_LDFLAGS="-L$PREFIX/lib -Wl,-rpath,@loader_path" ;;
     # No $ORIGIN here: FFmpeg's configure runs add_ldflags through eval and
