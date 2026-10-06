@@ -404,17 +404,21 @@ if ! step_done ffmpeg "$FFMPEG_VERSION-shared"; then
     # FFmpeg is installed. Placed at the end of
     # Libs.private so it (a) lands after -lx265 where GNU ld's one-pass
     # archive resolution can use it, and (b) is only emitted for the
-    # --static probes FFmpeg runs, never for plugin link lines.
+    # --static probes FFmpeg runs, never for plugin link lines. Only on
+    # non-Darwin hosts: x265 there is built with g++/mingw (libstdc++),
+    # while AppleClang uses the system libc++ and has no libstdc++ to find.
     # -i.bak (not -i): BSD sed on macOS requires the backup suffix attached.
     for pc in "$PREFIX"/lib/pkgconfig/*.pc; do
         sed -i.bak -e 's/ -lgcc_s//g' -e 's/ -lgcc//g' "$pc"
         rm -f "$pc.bak"
     done
-    sed -i.bak \
-        -e 's/ -lstdc++//g' \
-        -e 's/^Libs.private: \(.*\)$/Libs.private: \1 -lstdc++/' \
-        "$PREFIX/lib/pkgconfig/x265.pc"
-    rm -f "$PREFIX/lib/pkgconfig/x265.pc.bak"
+    if [ "$UNAME" != "Darwin" ]; then
+        sed -i.bak \
+            -e 's/ -lstdc++//g' \
+            -e 's/^Libs.private: \(.*\)$/Libs.private: \1 -lstdc++/' \
+            "$PREFIX/lib/pkgconfig/x265.pc"
+        rm -f "$PREFIX/lib/pkgconfig/x265.pc.bak"
+    fi
     case "$UNAME" in
     Darwin) RUNTIME_LDFLAGS="-L$PREFIX/lib -Wl,-rpath,@loader_path" ;;
     # No $ORIGIN here: FFmpeg's configure runs add_ldflags through eval and
