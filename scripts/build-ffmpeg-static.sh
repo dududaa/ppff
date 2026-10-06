@@ -390,15 +390,26 @@ if ! step_done ffmpeg "$FFMPEG_VERSION-shared"; then
         "$PREFIX"/lib/libavdevice.* "$PREFIX"/lib/libswscale.* \
         "$PREFIX"/lib/libswresample.*
     setup_stdcpp_shadow
-    # The .pc sed below (which keeps -lstdc++ out of *plugin* link lines)
-    # may already have run against this prefix in an earlier invocation:
-    # restore it for the x265 probe, which needs -lstdc++ on its link line
-    # to resolve x265's C++ runtime (via the static shadow above). It gets
-    # stripped again once FFmpeg is installed. Placed at the end of
+    # FFmpeg's configure bakes each dependency's `pkg-config --static --libs`
+    # output into its *global* extralibs, so an explicit -lgcc_s coming from
+    # a bundled .pc (x265's CMake lists it) would resolve to mingw's import
+    # library on Windows and collide with the static unwinder that
+    # -static-libgcc selects (multiple definition of _Unwind_Resume). The
+    # driver's -static-libgcc already supplies the runtime; strip -lgcc*
+    # from every bundled .pc before configuring. Also the .pc sed below
+    # (which keeps -lstdc++ out of *plugin* link lines) may already have run
+    # against this prefix in an earlier invocation: restore -lstdc++ for the
+    # x265 probe, which needs it on its link line to resolve x265's C++
+    # runtime (via the static shadow above). It gets stripped again once
+    # FFmpeg is installed. Placed at the end of
     # Libs.private so it (a) lands after -lx265 where GNU ld's one-pass
     # archive resolution can use it, and (b) is only emitted for the
     # --static probes FFmpeg runs, never for plugin link lines.
     # -i.bak (not -i): BSD sed on macOS requires the backup suffix attached.
+    for pc in "$PREFIX"/lib/pkgconfig/*.pc; do
+        sed -i.bak -e 's/ -lgcc_s//g' -e 's/ -lgcc//g' "$pc"
+        rm -f "$pc.bak"
+    done
     sed -i.bak \
         -e 's/ -lstdc++//g' \
         -e 's/^Libs.private: \(.*\)$/Libs.private: \1 -lstdc++/' \
