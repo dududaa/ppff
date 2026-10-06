@@ -407,15 +407,31 @@ if ! step_done ffmpeg "$FFMPEG_VERSION-shared"; then
     # --static probes FFmpeg runs, never for plugin link lines. Only on
     # non-Darwin hosts: x265 there is built with g++/mingw (libstdc++),
     # while AppleClang uses the system libc++ and has no libstdc++ to find.
-    # -i.bak (not -i): BSD sed on macOS requires the backup suffix attached.
+    # -i.bak (not -i): BSD sed on the macOS runner requires the backup suffix
+    # attached. Pure leading-space deletions are adjacency-safe (the scanner
+    # resumes before the next token's space) but ` -lgcc` would also eat the
+    # prefix of -lgcc_eh, leaving "_eh" behind — park -lgcc_eh out of the way
+    # and restore it afterwards. Same pattern at the plugin strip below.
     for pc in "$PREFIX"/lib/pkgconfig/*.pc; do
-        sed -i.bak -e 's/ -lgcc_s//g' -e 's/ -lgcc//g' "$pc"
+        sed -i.bak \
+            -e 's/-lgcc_eh/-lgxEh/g' \
+            -e 's/ -lgcc_s//g' \
+            -e 's/ -lgcc//g' \
+            -e 's/-lgxEh/-lgcc_eh/g' \
+            "$pc"
         rm -f "$pc.bak"
     done
     if [ "$UNAME" != "Darwin" ]; then
+        # On mingw x265's Libs.private is just "-lstdc++ -lgcc_s -lgcc": the
+        # strip above leaves a lone "-lstdc++" token that carries the space
+        # after "Libs.private:", and removing it then collapses the line to a
+        # bare "Libs.private:". The old append regex required ": " and never
+        # matched that, so the probe linked without the C++ runtime and died
+        # with "x265 not found using pkg-config". Match the key with optional
+        # whitespace so the -lstdc++ restore always lands.
         sed -i.bak \
             -e 's/ -lstdc++//g' \
-            -e 's/^Libs.private: \(.*\)$/Libs.private: \1 -lstdc++/' \
+            -e 's/^Libs.private:[[:space:]]*\(.*\)$/Libs.private: \1 -lstdc++/' \
             "$PREFIX/lib/pkgconfig/x265.pc"
         rm -f "$PREFIX/lib/pkgconfig/x265.pc.bak"
     fi
@@ -427,21 +443,29 @@ if ! step_done ffmpeg "$FFMPEG_VERSION-shared"; then
     *) RUNTIME_LDFLAGS="-L$PREFIX/lib -static-libstdc++ -static-libgcc" ;;
     esac
     extract "$DOWNLOADS/ffmpeg-${FFMPEG_VERSION}.tar.xz" "$WORK/ffmpeg"
-    (cd "$WORK/ffmpeg" &&
-        ./configure --prefix="$PREFIX" \
-            --disable-static --enable-shared --enable-pic \
-            --enable-gpl \
-            --enable-libx264 --enable-libx265 --enable-libvpx \
-            --enable-libaom --enable-libwebp --enable-libmp3lame \
-            --enable-libvorbis --enable-libopus \
-            --disable-programs --disable-doc --disable-debug \
-            --disable-xlib --disable-libxcb \
-            --disable-bzlib --disable-lzma \
-            --extra-cflags="-I$PREFIX/include" \
-            --extra-ldflags="$RUNTIME_LDFLAGS" \
-            --pkg-config-flags="--static" &&
-        make -j"$JOBS" &&
-        make install)
+    if ! (
+        cd "$WORK/ffmpeg" &&
+            ./configure --prefix="$PREFIX" \
+                --disable-static --enable-shared --enable-pic \
+                --enable-gpl \
+                --enable-libx264 --enable-libx265 --enable-libvpx \
+                --enable-libaom --enable-libwebp --enable-libmp3lame \
+                --enable-libvorbis --enable-libopus \
+                --disable-programs --disable-doc --disable-debug \
+                --disable-xlib --disable-libxcb \
+                --disable-bzlib --disable-lzma \
+                --extra-cflags="-I$PREFIX/include" \
+                --extra-ldflags="$RUNTIME_LDFLAGS" \
+                --pkg-config-flags="--static" &&
+            make -j"$JOBS" &&
+            make install
+    ); then
+        # configure hides pkg-config probe failures in config.log; surface
+        # them on the job console so CI failures are diagnosable.
+        echo "==> FFmpeg build failed; ffbuild/config.log tail:" >&2
+        tail -80 "$WORK/ffmpeg/ffbuild/config.log" 2>/dev/null >&2 || true
+        exit 1
+    fi
     # Linux: stamp DT_RUNPATH=$ORIGIN so each of the six libraries resolves
     # its siblings inside ppdrive's libs/ directory (patchelf instead of
     # --extra-ldflags because configure's eval would eat the $ORIGIN).
@@ -457,21 +481,43 @@ if ! step_done ffmpeg "$FFMPEG_VERSION-shared"; then
     # (plugins), @loader_path references between the runtime's own dylibs.
     if [ "$UNAME" = "Darwin" ]; then
         libs="libavcodec libavformat libavfilter libavutil libswscale libswresample"
-        names=""
         for l in $libs; do
             link="$(readlink "$PREFIX/lib/$l.dylib" || true)"
             base="${link:-$l.dylib}"
             install_name_tool -id "@rpath/$base" "$PREFIX/lib/$base"
-            names="$names $base"
         done
+        # Follow a reference's symlink chain to the real file name: FFmpeg
+        # records cross-references in soname form (libswresample.7.dylib)
+        # while we stage the full realnames, so exact-name -change misses.
+        resolve_ref_base() {
+            local p="$1" i=0 n
+            while [ -L "$p" ] && [ "$i" -lt 10 ]; do
+                n="$(readlink "$p")"
+                case "$n" in
+                /*) p="$n" ;;
+                *) p="$(dirname "$p")/$n" ;;
+                esac
+                i=$((i + 1))
+            done
+            basename "$p"
+        }
         for l in $libs; do
             link="$(readlink "$PREFIX/lib/$l.dylib" || true)"
             base="${link:-$l.dylib}"
             real="$PREFIX/lib/$base"
-            for dep in $names; do
-                install_name_tool -change "$PREFIX/lib/$dep" "@rpath/$dep" \
-                    "$real" 2>/dev/null || true
-            done
+            # Rewrite every recorded reference to a bundled library —
+            # unversioned, soname or full realpath form alike — to
+            # @rpath/<realname> so it resolves against the staged files.
+            otool -L "$real" | awk 'NR > 1 { print $1 }' |
+                while IFS= read -r ref; do
+                    case "$ref" in
+                    "$PREFIX/lib/"*)
+                        target_base="$(resolve_ref_base "$ref")"
+                        install_name_tool -change "$ref" "@rpath/$target_base" \
+                            "$real" 2>/dev/null || true
+                        ;;
+                    esac
+                done
             if ! otool -l "$real" | grep -q "@loader_path"; then
                 install_name_tool -add_rpath "@loader_path" "$real"
             fi
@@ -485,7 +531,13 @@ fi
 # dylibs, never -lstdc++, so strip those entries for them (the runtime
 # itself resolved libstdc++ via the shadow above, at its own link).
 for pc in "$PREFIX"/lib/pkgconfig/*.pc; do
-    sed -i.bak 's/-lstdc++//g; s/-lgcc_s//g; s/-lgcc//g' "$pc"
+    sed -i.bak \
+        -e 's/-lgcc_eh/-lgxEh/g' \
+        -e 's/ -lgcc_s//g' \
+        -e 's/ -lgcc//g' \
+        -e 's/-lgxEh/-lgcc_eh/g' \
+        -e 's/ -lstdc++//g' \
+        "$pc"
     rm -f "$pc.bak"
 done
 

@@ -160,7 +160,12 @@ jobs:
           needs_of() {
             case "$1" in
             *.so) readelf -d "$1" | sed -n 's/.*NEEDED.*\[\(.*\)\]/\1/p' ;;
-            *.dylib) otool -L "$1" | tail -n +2 | awk '{print $1}' ;;
+            *.dylib)
+              # otool -L prints the file header, then the LC_ID_DYLIB, then
+              # the real dependency load commands; drop the first two.
+              id="$(otool -D "$1" | sed -n '2p')"
+              otool -L "$1" | tail -n +2 | awk '{print $1}' | grep -vxF "$id"
+              ;;
             *.dll) objdump -p "$1" | sed -n 's/.*DLL Name: //p' ;;
             esac
           }
@@ -174,7 +179,8 @@ jobs:
           # Deps allowed in shipped artifacts: the bundled runtime's own
           # six libraries (plugins reference them; the runtime references
           # itself), known OS libraries, and on macOS anything the platform
-          # owns under /usr/lib (dyld shared cache).
+          # owns under /usr/lib (dyld shared cache) or
+          # /System/Library/Frameworks (AVFoundation, AudioToolbox, ...).
           allowed_dep() {
             local dep="$1"
             case "$dep" in
@@ -184,7 +190,7 @@ jobs:
             esac
             if [ "$RUNNER_OS" = "macOS" ]; then
                 case "$dep" in
-                /usr/lib/*) return 0 ;;
+                /usr/lib/* | /System/Library/*) return 0 ;;
                 esac
             fi
             echo "$dep" | grep -Eiq "$system_re"
@@ -257,12 +263,14 @@ jobs:
               syms="$(nm --defined-only -g "$f" || true)"
               ;;
             esac
-            if ! echo "$syms" | grep -qw plugin_dispatch; then
+            # macOS nm prefixes symbol names with "_", so allow an optional
+            # leading underscore (grep -w would reject _plugin_dispatch).
+            if ! echo "$syms" | grep -Eq '(^|[^[:alnum:]_])_?plugin_dispatch([^[:alnum:]_]|$)'; then
               err "plugin $f does not export plugin_dispatch"
             fi
             # A defined avcodec_open2 would mean a private FFmpeg copy got
             # linked in (undefined references to it are expected).
-            if echo "$syms" | grep -qw avcodec_open2; then
+            if echo "$syms" | grep -Eq '(^|[^[:alnum:]_])_?avcodec_open2([^[:alnum:]_]|$)'; then
               err "plugin $f defines FFmpeg symbols"
             fi
           done
