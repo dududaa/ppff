@@ -174,7 +174,7 @@ jobs:
           # dependency: everything here is either bundled *inside* the
           # runtime's dylibs or belongs to a host we must not require.
           deny_re='libx264|libx265|libvpx|libaom|libwebp|libmp3lame|libvorbis|libopus|libogg|libz\.so|zlib1|libX11|libxcb|libbz2|liblzma|libstdc\+\+|libgcc_s|libgcc_eh|libwinpthread'
-          system_re='^libc\.so|^libm\.so|^libmvec|^libpthread|^libdl|^librt\.so|^ld-linux|^ld64|^libSystem|^kernel32|^msvcrt|^ntdll|^user32|^advapi32|^shell32|^ws2_32|^ucrtbase|^vcruntime|^api-ms-win|^bcrypt|^ole32|^shlwapi|^winmm|^psapi|^version'
+          system_re='^libc\.so|^libm\.so|^libmvec|^libpthread|^libdl|^librt\.so|^ld-linux|^ld64|^libSystem|^kernel32|^msvcrt|^ntdll|^user32|^advapi32|^shell32|^ws2_32|^ucrtbase|^vcruntime|^api-ms-win|^bcrypt|^ole32|^shlwapi|^winmm|^psapi|^version|^crypt32|^ncrypt|^secur32|^userenv|^combase'
 
           # Deps allowed in shipped artifacts: the bundled runtime's own
           # six libraries (plugins reference them; the runtime references
@@ -260,7 +260,20 @@ jobs:
               fi
               ;;
             *.dll)
-              syms="$(nm --defined-only -g "$f" || true)"
+              # nm reports "no symbols" on stripped DLLs. Read the export
+              # name table instead — export-only: the full objdump -p output
+              # also lists imported names, and plugins legitimately import
+              # avcodec_open2.
+              syms="$(objdump -p "$f" | awk '
+                /^Export Address Table -- Name Pointer\/Ordinals/ {f = 1; next}
+                f && /^$/ {exit}
+                f {print}')"
+              if [ -z "$syms" ]; then
+                syms="$(objdump -p "$f" | awk '
+                  /Name Pointer\/Ordinals/ {f = 1; next}
+                  f && /^$/ {exit}
+                  f {print}')"
+              fi
               ;;
             esac
             # macOS nm prefixes symbol names with "_", so allow an optional

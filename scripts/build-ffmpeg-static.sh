@@ -381,6 +381,23 @@ setup_stdcpp_shadow() {
     fi
 }
 
+# mingw's -lpthread resolves to the libwinpthread import library by default,
+# which would leave libwinpthread-1.dll as a dependency of the shipped
+# runtime DLLs. Shadow both spellings (-lpthread and a possible driver
+# rewrite to -lwinpthread) with the static archive in $PREFIX/lib, which ld
+# searches before the system directories.
+setup_pthread_shadow() {
+    [ "$IS_WINDOWS" -eq 1 ] || return 0
+    local archive
+    archive="$(gcc -print-file-name=libwinpthread.a)"
+    if [ "$archive" = "libwinpthread.a" ] || [ ! -f "$archive" ]; then
+        echo "error: static libwinpthread.a not found; runtime would depend on libwinpthread-1.dll" >&2
+        exit 1
+    fi
+    cp -f "$archive" "$PREFIX/lib/libpthread.a"
+    cp -f "$archive" "$PREFIX/lib/libwinpthread.a"
+}
+
 if ! step_done ffmpeg "$FFMPEG_VERSION-shared"; then
     echo "==> FFmpeg ${FFMPEG_VERSION} (shared runtime, GPL)"
     # Drop outputs of a previous static build in this prefix so the shared
@@ -390,6 +407,7 @@ if ! step_done ffmpeg "$FFMPEG_VERSION-shared"; then
         "$PREFIX"/lib/libavdevice.* "$PREFIX"/lib/libswscale.* \
         "$PREFIX"/lib/libswresample.*
     setup_stdcpp_shadow
+    setup_pthread_shadow
     # FFmpeg's configure bakes each dependency's `pkg-config --static --libs`
     # output into its *global* extralibs, so an explicit -lgcc_s coming from
     # a bundled .pc (x265's CMake lists it) would resolve to mingw's import
@@ -443,6 +461,12 @@ if ! step_done ffmpeg "$FFMPEG_VERSION-shared"; then
     *) RUNTIME_LDFLAGS="-L$PREFIX/lib -static-libstdc++ -static-libgcc" ;;
     esac
     extract "$DOWNLOADS/ffmpeg-${FFMPEG_VERSION}.tar.xz" "$WORK/ffmpeg"
+    # mingw's libiconv would become a dependency of the shipped avcodec and
+    # avformat DLLs; ppdrive does no charset conversion, so drop it.
+    iconv_flag=""
+    if [ "$IS_WINDOWS" -eq 1 ]; then
+        iconv_flag="--disable-iconv"
+    fi
     if ! (
         cd "$WORK/ffmpeg" &&
             ./configure --prefix="$PREFIX" \
@@ -454,6 +478,7 @@ if ! step_done ffmpeg "$FFMPEG_VERSION-shared"; then
                 --disable-programs --disable-doc --disable-debug \
                 --disable-xlib --disable-libxcb \
                 --disable-bzlib --disable-lzma \
+                $iconv_flag \
                 --extra-cflags="-I$PREFIX/include" \
                 --extra-ldflags="$RUNTIME_LDFLAGS" \
                 --pkg-config-flags="--static" &&
