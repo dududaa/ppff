@@ -97,6 +97,16 @@ jobs:
             exit 1
           fi
           echo "LIBCLANG_PATH=$(dirname "$libclang")" >> "$GITHUB_ENV"
+          # libclang's resource-dir auto-detection misses the RPM layout
+          # here, and glibc's limits.h `#include_next <limits.h>` then
+          # can't find clang's builtin limits.h. Pin it for bindgen.
+          resdir=$(ls -d /usr/lib/clang/* 2>/dev/null | head -n1 || true)
+          if [ -z "$resdir" ]; then
+            echo "clang resource dir missing (clang-libs incomplete?)" >&2
+            exit 1
+          fi
+          ls "$resdir"/include/limits.h
+          echo "BINDGEN_EXTRA_CLANG_ARGS=-resource-dir $resdir" >> "$GITHUB_ENV"
           # Prefer the gcc-toolset compiler: newer than the system gcc,
           # still linked against the container's glibc 2.28.
           if [ -d /opt/rh/gcc-toolset-12/root/usr/bin ]; then
