@@ -454,6 +454,22 @@ if ! step_done ffmpeg "$FFMPEG_VERSION-shared"; then
             "$PREFIX/lib/pkgconfig/x265.pc"
         rm -f "$PREFIX/lib/pkgconfig/x265.pc.bak"
     fi
+    # glibc < 2.34 (the manylinux_2_28 floor: AlmaLinux 8/9, Debian 10/11)
+    # keeps pthread and POSIX-semaphore symbols in libpthread.so.0, not
+    # libc. Several bundled .pc files omit -lpthread from Libs.private,
+    # which was harmless on the ubuntu-22.04 runner (glibc 2.35 merged
+    # pthread into libc) but fails the x265 probe link here with
+    # "undefined reference to pthread_create". Linux only: mac has
+    # pthreads in libSystem, and windows link lines must keep resolving
+    # pthreads through the static winpthread shadow.
+    if [ "$UNAME" = "Linux" ]; then
+        for pc in "$PREFIX"/lib/pkgconfig/*.pc; do
+            if grep -q '^Libs.private:' "$pc" && ! grep -q '^Libs.private:.*-lpthread' "$pc"; then
+                sed -i.bak -e '/^Libs.private:/s/$/ -lpthread/' "$pc"
+                rm -f "$pc.bak"
+            fi
+        done
+    fi
     case "$UNAME" in
     Darwin) RUNTIME_LDFLAGS="-L$PREFIX/lib -Wl,-rpath,@loader_path" ;;
     # No $ORIGIN here: FFmpeg's configure runs add_ldflags through eval and
