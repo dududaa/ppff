@@ -339,7 +339,13 @@ fi
 if ! step_done zlib "$ZLIB_VERSION"; then
     echo "==> zlib ${ZLIB_VERSION} (static)"
     extract "$DOWNLOADS/zlib-${ZLIB_VERSION}.tar.gz" "$WORK/zlib"
+    # -fPIC is required: libz.a gets linked into the six shared FFmpeg
+    # libs. Ubuntu's gcc builds PIE by default (which masked the missing
+    # flag) but the manylinux toolset gcc does not, and the link then
+    # dies with "relocation R_X86_64_32S ... can not be used when making
+    # a shared object".
     (cd "$WORK/zlib" &&
+        CFLAGS="${CFLAGS:--O3} -fPIC" &&
         ./configure --prefix="$PREFIX" --static &&
         make -j"$JOBS" &&
         make install)
