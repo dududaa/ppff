@@ -81,10 +81,22 @@ jobs:
           have git || need+=(git)
           have file || need+=(file)
           have which || need+=(which)
+          # bindgen (plugin build) needs libclang.so; ubuntu runners have
+          # LLVM preinstalled, the manylinux image does not.
+          if ! ls /usr/lib64/libclang.so.* /usr/lib/llvm*/lib/libclang.so.* 2>/dev/null | grep -q .; then
+            need+=(clang-libs)
+          fi
           if [ "${#need[@]}" -gt 0 ]; then
             dnf install -y epel-release || true
             dnf install -y "${need[@]}"
           fi
+          # bindgen locates libclang through LIBCLANG_PATH
+          libclang=$(ls /usr/lib64/libclang.so.* /usr/lib/llvm*/lib/libclang.so.* 2>/dev/null | head -n1 || true)
+          if [ -z "$libclang" ]; then
+            echo "missing libclang (needed by bindgen)" >&2
+            exit 1
+          fi
+          echo "LIBCLANG_PATH=$(dirname "$libclang")" >> "$GITHUB_ENV"
           # Prefer the gcc-toolset compiler: newer than the system gcc,
           # still linked against the container's glibc 2.28.
           if [ -d /opt/rh/gcc-toolset-12/root/usr/bin ]; then
