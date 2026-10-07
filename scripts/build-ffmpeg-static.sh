@@ -267,6 +267,7 @@ if ! step_done libaom "$AOM_VERSION"; then
     tar -xf "$DOWNLOADS/aom-${AOM_VERSION}.tar.gz" -C "$WORK/aom"
     cmake -S "$WORK/aom" -B "$WORK/aom/build" -G "Unix Makefiles" \
         -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+        -DCMAKE_INSTALL_LIBDIR=lib \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_SHARED_LIBS=0 \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
@@ -486,9 +487,18 @@ if ! step_done ffmpeg "$FFMPEG_VERSION-shared"; then
             make install
     ); then
         # configure hides pkg-config probe failures in config.log; surface
-        # them on the job console so CI failures are diagnosable.
-        echo "==> FFmpeg build failed; ffbuild/config.log tail:" >&2
-        tail -80 "$WORK/ffmpeg/ffbuild/config.log" 2>/dev/null >&2 || true
+        # them on the job console so CI failures are diagnosable. (Order
+        # matters: fd2 must still be the log before stdout is redirected
+        # to it, otherwise 2>/dev/null swallows the tail too.)
+        echo "==> FFmpeg build failed; diagnostics:" >&2
+        echo "--- \$PREFIX/lib/pkgconfig:" >&2
+        ls -la "$PREFIX/lib/pkgconfig" >&2 2>/dev/null || true
+        echo "--- pkg-config probe:" >&2
+        pkg-config --exists --print-errors "aom >= 2.0.0" \
+            || pkg-config --exists --print-errors "aom" \
+            || echo "pkg-config could not resolve aom" >&2
+        echo "--- ffbuild/config.log tail:" >&2
+        tail -80 "$WORK/ffmpeg/ffbuild/config.log" >&2 2>/dev/null || true
         exit 1
     fi
     # Linux: stamp DT_RUNPATH=$ORIGIN so each of the six libraries resolves
