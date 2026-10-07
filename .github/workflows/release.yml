@@ -12,55 +12,110 @@ jobs:
   build:
     name: Build (${{ matrix.os_name }}-${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
+    # fromJSON(matrix.container): the manylinux_2_28 image for linux
+    # (glibc 2.28 floor), null for macOS (runs on the host directly).
+    container: ${{ fromJSON(matrix.container) }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          # ubuntu-22.04 keeps the glibc floor of the shipped plugins at
-          # 2.35 so they load on Debian 12 / Ubuntu 22.04+ / RHEL 9 hosts.
+          # The linux build runs inside a manylinux_2_28 container so
+          # every shipped .so has a glibc 2.28 floor: AlmaLinux/RHEL 8+
+          # (2.28), Debian 10+ (2.28), Ubuntu 20.04+ (2.31) — including
+          # hosts older than the ubuntu-22.04 runner itself (2.35), which
+          # the previous floor excluded (AlmaLinux 9 = 2.34 could not
+          # load the v0.3.1 runtime).
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             os_name: linux
             arch: x86_64
+            cache_key: bundled-ffmpeg-glibc228-linux-x86_64
+            container: '{"image": "quay.io/pypa/manylinux_2_28_x86_64"}'
           - os: macos-latest
             target: aarch64-apple-darwin
             os_name: macos
             arch: aarch64
+            cache_key: bundled-ffmpeg-macos-aarch64
+            container: 'null'
           - os: macos-15-intel
             target: x86_64-apple-darwin
             os_name: macos
             arch: x86_64
-          # Windows is temporarily excluded from v0.3.1: its Verify step
-          # still rejects the plugin export check. Re-enable for v0.3.2
-          # together with the fix.
+            cache_key: bundled-ffmpeg-macos-x86_64
+            container: 'null'
+          # Windows is temporarily excluded: its Verify step still
+          # rejects the plugin export check. Re-enable for a later
+          # release together with the fix (Windows runners cannot run
+          # job containers, hence container: 'null').
           # - os: windows-latest
           #   target: x86_64-pc-windows-gnu
           #   os_name: windows
           #   arch: x86_64
+          #   cache_key: bundled-ffmpeg-windows-x86_64
+          #   container: 'null'
     steps:
       - uses: actions/checkout@v4
+
+      # Linux runs in the manylinux_2_28 container: most tools are
+      # already there, pull only what the image lacks (EPEL covers
+      # patchelf). Fail loudly if a required tool is still missing.
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          have() { command -v "$1" >/dev/null 2>&1; }
+          need=()
+          have gcc || need+=(gcc)
+          have g++ || need+=(gcc-c++)
+          have make || need+=(make)
+          have cmake || need+=(cmake)
+          have nasm || need+=(nasm)
+          have yasm || need+=(yasm)
+          have patchelf || need+=(patchelf)
+          have pkg-config || need+=(pkgconf-pkg-config)
+          have perl || need+=(perl)
+          have tar || need+=(tar)
+          have xz || need+=(xz)
+          have gzip || need+=(gzip)
+          have curl || need+=(curl)
+          have git || need+=(git)
+          have file || need+=(file)
+          have which || need+=(which)
+          if [ "${#need[@]}" -gt 0 ]; then
+            dnf install -y epel-release || true
+            dnf install -y "${need[@]}"
+          fi
+          # Prefer the gcc-toolset compiler: newer than the system gcc,
+          # still linked against the container's glibc 2.28.
+          if [ -d /opt/rh/gcc-toolset-12/root/usr/bin ]; then
+            echo /opt/rh/gcc-toolset-12/root/usr/bin >> "$GITHUB_PATH"
+          fi
+          for t in gcc g++ make cmake nasm yasm patchelf pkg-config perl curl git; do
+            command -v "$t" >/dev/null || { echo "missing required tool: $t" >&2; exit 1; }
+          done
+
+      - name: Install build tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install nasm yasm cmake pkg-config
 
       - name: Install Rust (Linux, macOS)
         if: runner.os != 'Windows'
         run: |
+          set -euo pipefail
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+          fi
+          export PATH="$HOME/.cargo/bin:$PATH"
           rustup toolchain install stable --profile minimal
           rustup default stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Install Rust (Windows/GNU host)
         if: runner.os == 'Windows'
         run: |
           rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
           rustup default stable-x86_64-pc-windows-gnu
-
-      - name: Install build tools (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config nasm yasm cmake patchelf
-
-      - name: Install build tools (macOS)
-        if: runner.os == 'macOS'
-        run: brew install nasm yasm cmake pkg-config
 
       - name: Install build tools (Windows/MSYS2)
         if: runner.os == 'Windows'
@@ -82,10 +137,13 @@ jobs:
           path: |
             ~/ppff-ffmpeg
             ~/ppff-ffmpeg-work/downloads
-          key: bundled-ffmpeg-${{ matrix.os_name }}-${{ matrix.arch }}-${{ hashFiles('scripts/build-ffmpeg-static.sh') }}
+          # The workflow file is part of the key: container/toolchain
+          # changes in it must not silently reuse a stale build. The linux
+          # cache_key prefix (glibc228) never matches the pre-container
+          # caches, so linux always rebuilds inside the manylinux image.
+          key: ${{ matrix.cache_key }}-${{ hashFiles('scripts/build-ffmpeg-static.sh', '.github/workflows/release.yml') }}
           restore-keys: |
-            bundled-ffmpeg-${{ matrix.os_name }}-${{ matrix.arch }}-
-            static-ffmpeg-${{ matrix.os_name }}-${{ matrix.arch }}-
+            ${{ matrix.cache_key }}-
 
       - name: Build bundled FFmpeg runtime (Linux, macOS)
         if: runner.os != 'Windows'
@@ -159,6 +217,22 @@ jobs:
           fail=0
           err() { echo "ERROR: $*" >&2; fail=1; }
 
+          # The linux build must stay loadable on glibc 2.28+ hosts
+          # (AlmaLinux/RHEL 8, Debian 10, Ubuntu 20.04 — e.g. the
+          # AlmaLinux 9 production host that could not load the 2.35-floor
+          # v0.3.1 runtime): no shipped .so may require a newer GLIBC_
+          # versioned symbol than 2.28.
+          check_glibc_floor() {
+            [ "$RUNNER_OS" = "Linux" ] || return 0
+            local max v
+            max="$(objdump -T "$1" 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1 || true)"
+            [ -n "$max" ] || return 0
+            v="${max#GLIBC_}"
+            if [ "$(printf '%s\n' 2.28 "$v" | sort -uV | tail -1)" != "2.28" ]; then
+              err "$1 requires $max (glibc floor must stay <= 2.28)"
+            fi
+          }
+
           # Emit one bare dependency name per line.
           needs_of() {
             case "$1" in
@@ -217,6 +291,7 @@ jobs:
                 err "runtime $(basename "$f") has unexpected dep $dep"
               fi
             done < <(needs_of "$f")
+            check_glibc_floor "$f"
             if [ "$RUNNER_OS" = "macOS" ] && otool -L "$f" | grep -q "ppff-ffmpeg"; then
               err "runtime $(basename "$f") records a build-time path"
             fi
@@ -255,6 +330,7 @@ jobs:
               syms="$(readelf --dyn-syms -W "$f" | grep -v ' UND ' || true)"
               echo -n "  highest GLIBC symbol version: "
               objdump -T "$f" | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1 || true
+              check_glibc_floor "$f"
               ;;
             *.dylib)
               syms="$(nm -gU "$f" || true)"
@@ -353,7 +429,8 @@ jobs:
           EOF
           extra_ld=""
           if [ "$RUNNER_OS" = "Linux" ]; then extra_ld="-ldl"; fi
-          if cc -o smoke/load smoke/load.c $extra_ld; then
+          cc_bin="$(command -v cc || command -v gcc || true)"
+          if [ -n "$cc_bin" ] && "$cc_bin" -o smoke/load smoke/load.c $extra_ld; then
             if [ "$RUNNER_OS" = "Linux" ] && [ "${#plugins[@]}" -ge 2 ]; then
               ./smoke/load "${plugins[0]}" "${plugins[1]}"
             else
