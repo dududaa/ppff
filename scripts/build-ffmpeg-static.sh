@@ -345,8 +345,7 @@ if ! step_done zlib "$ZLIB_VERSION"; then
     # dies with "relocation R_X86_64_32S ... can not be used when making
     # a shared object".
     (cd "$WORK/zlib" &&
-        CFLAGS="${CFLAGS:--O3} -fPIC" &&
-        ./configure --prefix="$PREFIX" --static &&
+        CFLAGS="${CFLAGS:--O3} -fPIC" ./configure --prefix="$PREFIX" --static &&
         make -j"$JOBS" &&
         make install)
     step_mark zlib "$ZLIB_VERSION"
